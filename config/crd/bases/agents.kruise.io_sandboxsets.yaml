@@ -20,6 +20,12 @@ spec:
     - jsonPath: .status.replicas
       name: Replicas
       type: integer
+    - jsonPath: .status.updatedReplicas
+      name: Updated
+      type: integer
+    - jsonPath: .status.expectedUpdatedReplicas
+      name: Expected
+      type: integer
     - jsonPath: .status.availableReplicas
       name: Available
       type: integer
@@ -90,6 +96,47 @@ spec:
                     type: string
                 required:
                 - name
+                type: object
+              updateStrategy:
+                description: UpdateStrategy controls rolling update behavior for unclaimed
+                  sandboxes
+                properties:
+                  maxSurge:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      MaxSurge is max extra sandboxes created during update.
+                      Value can be absolute number (ex: 5) or percentage (ex: 10%).
+                      Defaults to 0.
+                    x-kubernetes-int-or-string: true
+                  maxUnavailable:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      MaxUnavailable is max sandboxes unavailable during update.
+                      Value can be absolute number (ex: 5) or percentage (ex: 20%).
+                      Defaults to 20%.
+                    x-kubernetes-int-or-string: true
+                  partition:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      Partition is the number of sandboxes to keep on old version.
+                      Value can be absolute number (ex: 5) or percentage (ex: 10%).
+                      Defaults to 0.
+                    x-kubernetes-int-or-string: true
+                  type:
+                    default: RollingUpdate
+                    description: |-
+                      Type is the update strategy type. Can be RollingUpdate or OnDelete.
+                      Defaults to RollingUpdate.
+                    enum:
+                    - RollingUpdate
+                    - OnDelete
+                    type: string
                 type: object
               volumeClaimTemplates:
                 description: VolumeClaimTemplates is a list of PVC templates to create
@@ -578,6 +625,17 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              currentRevision:
+                description: |-
+                  CurrentRevision is the stable revision that has been fully rolled out.
+                  This field is updated only after a rolling update completes.
+                type: string
+              expectedUpdatedReplicas:
+                description: |-
+                  ExpectedUpdatedReplicas is the expected number of sandboxes that should have the updateRevision.
+                  This is calculated as replicas - partition.
+                format: int32
+                type: integer
               observedGeneration:
                 description: |-
                   observedGeneration is the most recent generation observed for this SandboxSet. It corresponds to the
@@ -596,11 +654,21 @@ spec:
                   duplication for CRDs that do not support structural schemas.
                 type: string
               updateRevision:
-                description: UpdateRevision is the template-hash calculated from `spec.template`.
+                description: |-
+                  UpdateRevision is the template-hash calculated from `spec.template`.
+                  It represents the target revision we want all sandboxes to have.
                 type: string
+              updatedReplicas:
+                description: |-
+                  UpdatedReplicas is the number of sandboxes that have the updateRevision template.
+                  This shows the progress of rolling updates.
+                format: int32
+                type: integer
             required:
             - availableReplicas
+            - expectedUpdatedReplicas
             - replicas
+            - updatedReplicas
             type: object
         required:
         - spec

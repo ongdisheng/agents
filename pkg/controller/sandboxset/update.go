@@ -1,0 +1,267 @@
+package sandboxset
+
+import (
+	"context"
+	"sort"
+
+	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
+	"github.com/openkruise/agents/pkg/utils"
+	"github.com/openkruise/agents/pkg/utils/expectations"
+	"github.com/openkruise/agents/pkg/utils/sandboxutils"
+	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/integer"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+type updateDiffs struct {
+	updateNum            int
+	updateMaxUnavailable int
+}
+
+func intAbs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func isSandboxAvailable(sbx *agentsv1alpha1.Sandbox) bool {
+	if sbx.DeletionTimestamp != nil {
+		return false
+	}
+	state, _ := sandboxutils.GetSandboxState(sbx)
+	return state == agentsv1alpha1.SandboxStateAvailable
+}
+
+func calculateDiffsWithExpectation(
+	sbs *agentsv1alpha1.SandboxSet,
+	sandboxes []*agentsv1alpha1.Sandbox,
+	currentRevision string,
+	updateRevision string,
+) updateDiffs {
+	replicas := int(sbs.Spec.Replicas)
+	var partition, maxSurge, maxUnavailable int
+
+	// Calculate partition using shared utility
+	if sbs.Spec.UpdateStrategy.Partition != nil {
+		pValue, _ := utils.CalculatePartitionReplicas(sbs.Spec.UpdateStrategy.Partition, sbs.Spec.Replicas)
+		partition = pValue
+	}
+
+	// Parse maxSurge
+	if sbs.Spec.UpdateStrategy.MaxSurge != nil {
+		maxSurge, _ = intstrutil.GetScaledValueFromIntOrPercent(
+			sbs.Spec.UpdateStrategy.MaxSurge,
+			replicas,
+			true,
+		)
+	}
+
+	// Parse maxUnavailable with default 20%
+	maxUnavailableIntOrStr := sbs.Spec.UpdateStrategy.MaxUnavailable
+	if maxUnavailableIntOrStr == nil {
+		defaultValue := intstrutil.FromString(agentsv1alpha1.DefaultSandboxSetMaxUnavailable)
+		maxUnavailableIntOrStr = &defaultValue
+	}
+	maxUnavailable, _ = intstrutil.GetScaledValueFromIntOrPercent(
+		maxUnavailableIntOrStr,
+		replicas,
+		maxSurge == 0,
+	)
+
+	// Count sandboxes by revision
+	var newRevisionCount, oldRevisionCount int
+
+	for _, sbx := range sandboxes {
+		if sbx.Labels[agentsv1alpha1.LabelTemplateHash] == updateRevision {
+			newRevisionCount++
+		} else {
+			oldRevisionCount++
+		}
+	}
+
+	// Calculate update diff from both directions
+	updateOldDiff := oldRevisionCount - partition
+	updateNewDiff := newRevisionCount - (replicas - partition)
+
+	// Block rollback when template unchanged
+	if updateRevision == currentRevision {
+		updateOldDiff = integer.IntMax(updateOldDiff, 0)
+		updateNewDiff = integer.IntMin(updateNewDiff, 0)
+	}
+
+	// Choose smaller absolute value
+	var updateNum int
+	if intAbs(updateOldDiff) <= intAbs(updateNewDiff) {
+		updateNum = updateOldDiff
+	} else {
+		updateNum = -updateNewDiff
+	}
+
+	updateMaxUnavailable := maxUnavailable + len(sandboxes) - replicas
+
+	return updateDiffs{
+		updateNum:            updateNum,
+		updateMaxUnavailable: updateMaxUnavailable,
+	}
+}
+
+func (r *Reconciler) updateSandboxes(
+	ctx context.Context,
+	sbs *agentsv1alpha1.SandboxSet,
+	sandboxes []*agentsv1alpha1.Sandbox,
+	currentRevision string,
+	updateRevision string,
+) error {
+	log := logf.FromContext(ctx)
+
+	// Check if update strategy is OnDelete
+	if sbs.Spec.UpdateStrategy.Type == agentsv1alpha1.OnDeleteSandboxSetUpdateStrategyType {
+		log.V(3).Info("UpdateStrategy is OnDelete, skip rolling update")
+		return nil
+	}
+
+	// Calculate diffs
+	diffRes := calculateDiffsWithExpectation(sbs, sandboxes, currentRevision, updateRevision)
+	if diffRes.updateNum == 0 {
+		return nil
+	}
+
+	// Find sandboxes that can be updated
+	var waitUpdateIndexes []int
+	for i, sbx := range sandboxes {
+		// Skip claimed sandboxes
+		if sbx.Labels[agentsv1alpha1.LabelSandboxIsClaimed] == "true" {
+			continue
+		}
+
+		// Skip sandboxes being deleted
+		if sbx.DeletionTimestamp != nil {
+			continue
+		}
+
+		// Skip paused sandboxes
+		state, _ := sandboxutils.GetSandboxState(sbx)
+		if state == agentsv1alpha1.SandboxStatePaused {
+			continue
+		}
+
+		// Check if needs update
+		if sbx.Labels[agentsv1alpha1.LabelTemplateHash] != updateRevision {
+			waitUpdateIndexes = append(waitUpdateIndexes, i)
+		}
+	}
+
+	if len(waitUpdateIndexes) == 0 {
+		return nil
+	}
+
+	// Sort sandboxes by state priority, then by age
+	sort.SliceStable(waitUpdateIndexes, func(i, j int) bool {
+		sbxI := sandboxes[waitUpdateIndexes[i]]
+		sbxJ := sandboxes[waitUpdateIndexes[j]]
+
+		stateI, _ := sandboxutils.GetSandboxState(sbxI)
+		stateJ, _ := sandboxutils.GetSandboxState(sbxJ)
+
+		priorityI := getStatePriority(stateI)
+		priorityJ := getStatePriority(stateJ)
+
+		if priorityI != priorityJ {
+			return priorityI < priorityJ
+		}
+
+		// Same state, sort by age
+		return sbxI.CreationTimestamp.Before(&sbxJ.CreationTimestamp)
+	})
+
+	// Limit by updateNum
+	updateDiff := intAbs(diffRes.updateNum)
+	if updateDiff < len(waitUpdateIndexes) {
+		waitUpdateIndexes = waitUpdateIndexes[:updateDiff]
+	}
+
+	// Count current unavailable sandboxes
+	var unavailableCount int
+	for _, sbx := range sandboxes {
+		if !isSandboxAvailable(sbx) {
+			unavailableCount++
+		}
+	}
+
+	// Limit by maxUnavailable
+	var canUpdateCount int
+	for _, idx := range waitUpdateIndexes {
+		sbx := sandboxes[idx]
+
+		if isSandboxAvailable(sbx) {
+			// Updating available sandbox increases unavailable count
+			if unavailableCount >= diffRes.updateMaxUnavailable {
+				break
+			}
+			unavailableCount++
+		}
+		// If already unavailable, doesn't count against limit
+		canUpdateCount++
+	}
+
+	if canUpdateCount < len(waitUpdateIndexes) {
+		waitUpdateIndexes = waitUpdateIndexes[:canUpdateCount]
+	}
+
+	// Delete sandboxes for update
+	controllerKey := GetControllerKey(sbs)
+	for _, idx := range waitUpdateIndexes {
+		sbx := sandboxes[idx]
+		scaleDownExpectation.ExpectScale(controllerKey, expectations.Delete, sbx.Name)
+		if err := r.Delete(ctx, sbx); err != nil {
+			log.Error(err, "failed to delete sandbox for update", "sandbox", sbx.Name)
+			scaleDownExpectation.ObserveScale(controllerKey, expectations.Delete, sbx.Name)
+			return err
+		}
+		log.V(3).Info("deleted sandbox for update", "sandbox", sbx.Name)
+	}
+
+	log.Info("update finished", "deleted", len(waitUpdateIndexes))
+	return nil
+}
+
+func getStatePriority(state string) int {
+	switch state {
+	case agentsv1alpha1.SandboxStateCreating:
+		return 1
+	case agentsv1alpha1.SandboxStateAvailable:
+		return 2
+	default:
+		return 3
+	}
+}
+
+func updateStatus(
+	newStatus *agentsv1alpha1.SandboxSetStatus,
+	sandboxes []*agentsv1alpha1.Sandbox,
+	sbs *agentsv1alpha1.SandboxSet,
+	currentRevision, updateRevision string,
+) {
+	// Count UpdatedReplicas
+	var updatedCount int32
+	for _, sbx := range sandboxes {
+		if sbx.Labels[agentsv1alpha1.LabelTemplateHash] == updateRevision {
+			updatedCount++
+		}
+	}
+	newStatus.UpdatedReplicas = updatedCount
+
+	// Calculate ExpectedUpdatedReplicas using shared utility
+	partition := 0
+	if sbs.Spec.UpdateStrategy.Partition != nil {
+		pValue, _ := utils.CalculatePartitionReplicas(sbs.Spec.UpdateStrategy.Partition, sbs.Spec.Replicas)
+		partition = pValue
+	}
+	newStatus.ExpectedUpdatedReplicas = sbs.Spec.Replicas - int32(partition)
+
+	// Update CurrentRevision when rolling update completes
+	if currentRevision != updateRevision && updatedCount == newStatus.ExpectedUpdatedReplicas {
+		newStatus.CurrentRevision = updateRevision
+	}
+}

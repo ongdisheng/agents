@@ -39,6 +39,12 @@ func (r *Reconciler) initNewStatus(ss *agentsv1alpha1.SandboxSet) (*agentsv1alph
 	})
 	newStatus.UpdateRevision = hash
 	newStatus.ObservedGeneration = ss.Generation
+
+	// Initialize CurrentRevision on first reconcile
+	if newStatus.CurrentRevision == "" {
+		newStatus.CurrentRevision = newStatus.UpdateRevision
+	}
+
 	return newStatus, nil
 }
 

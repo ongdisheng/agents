@@ -171,6 +171,27 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		log.Info("scale finished", "cost", time.Since(start))
 	}
 
+	// Step 1.5: perform rolling update
+	start = time.Now()
+	if delta == 0 && scaleUpSatisfied && scaleDownSatisfied && sbs.DeletionTimestamp == nil {
+		allSandboxes := append(groups.Creating, groups.Available...)
+		allSandboxes = append(allSandboxes, groups.Used...)
+
+		currentRevision := sbs.Status.CurrentRevision
+		updateRevision := newStatus.UpdateRevision
+
+		err = r.updateSandboxes(ctx, sbs, allSandboxes, currentRevision, updateRevision)
+		if err != nil {
+			log.Error(err, "failed to perform rolling update", "cost", time.Since(start))
+			allErrors = errors.Join(allErrors, err)
+		} else {
+			log.Info("rolling update finished", "cost", time.Since(start))
+		}
+
+		// Calculate and update rolling update status
+		updateStatus(newStatus, allSandboxes, sbs, currentRevision, updateRevision)
+	}
+
 	// Step 2: delete dead sandboxes
 	start = time.Now()
 	if err = r.deleteDeadSandboxes(ctx, groups.Dead); err != nil {

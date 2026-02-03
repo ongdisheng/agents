@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 const (
@@ -44,6 +45,9 @@ const (
 	SandboxStateRunning   = "running"
 	SandboxStatePaused    = "paused"
 	SandboxStateDead      = "dead"
+
+	// DefaultSandboxSetMaxUnavailable is the default maxUnavailable for rolling update
+	DefaultSandboxSetMaxUnavailable = "20%"
 )
 
 var SandboxSetControllerKind = GroupVersion.WithKind("SandboxSet")
@@ -56,8 +60,51 @@ type SandboxSetSpec struct {
 	// PersistentContents indicates resume pod with persistent content, Enum: ip, memory, filesystem
 	PersistentContents []string `json:"persistentContents,omitempty"`
 
+	// UpdateStrategy controls rolling update behavior for unclaimed sandboxes
+	// +optional
+	UpdateStrategy SandboxSetUpdateStrategy `json:"updateStrategy,omitempty"`
+
 	SandboxTemplate `json:",inline"`
 }
+
+// SandboxSetUpdateStrategy defines rolling update parameters
+type SandboxSetUpdateStrategy struct {
+	// Type is the update strategy type. Can be RollingUpdate or OnDelete.
+	// Defaults to RollingUpdate.
+	// +optional
+	// +kubebuilder:validation:Enum=RollingUpdate;OnDelete
+	// +kubebuilder:default=RollingUpdate
+	Type SandboxSetUpdateStrategyType `json:"type,omitempty"`
+
+	// Partition is the number of sandboxes to keep on old version.
+	// Value can be absolute number (ex: 5) or percentage (ex: 10%).
+	// Defaults to 0.
+	// +optional
+	Partition *intstr.IntOrString `json:"partition,omitempty"`
+
+	// MaxUnavailable is max sandboxes unavailable during update.
+	// Value can be absolute number (ex: 5) or percentage (ex: 20%).
+	// Defaults to 20%.
+	// +optional
+	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
+
+	// MaxSurge is max extra sandboxes created during update.
+	// Value can be absolute number (ex: 5) or percentage (ex: 10%).
+	// Defaults to 0.
+	// +optional
+	MaxSurge *intstr.IntOrString `json:"maxSurge,omitempty"`
+}
+
+// SandboxSetUpdateStrategyType defines the update strategy type
+type SandboxSetUpdateStrategyType string
+
+const (
+	// RollingUpdateSandboxSetUpdateStrategyType gradually updates sandboxes
+	RollingUpdateSandboxSetUpdateStrategyType SandboxSetUpdateStrategyType = "RollingUpdate"
+
+	// OnDeleteSandboxSetUpdateStrategyType only updates when manually deleted
+	OnDeleteSandboxSetUpdateStrategyType SandboxSetUpdateStrategyType = "OnDelete"
+)
 
 // SandboxSetStatus defines the observed state of SandboxSet.
 type SandboxSetStatus struct {
@@ -71,8 +118,22 @@ type SandboxSetStatus struct {
 	// AvailableReplicas is the number of available sandboxes, which are ready to be claimed.
 	AvailableReplicas int32 `json:"availableReplicas"`
 
+	// UpdatedReplicas is the number of sandboxes that have the updateRevision template.
+	// This shows the progress of rolling updates.
+	UpdatedReplicas int32 `json:"updatedReplicas"`
+
+	// ExpectedUpdatedReplicas is the expected number of sandboxes that should have the updateRevision.
+	// This is calculated as replicas - partition.
+	ExpectedUpdatedReplicas int32 `json:"expectedUpdatedReplicas"`
+
 	// UpdateRevision is the template-hash calculated from `spec.template`.
+	// It represents the target revision we want all sandboxes to have.
 	UpdateRevision string `json:"updateRevision,omitempty"`
+
+	// CurrentRevision is the stable revision that has been fully rolled out.
+	// This field is updated only after a rolling update completes.
+	// +optional
+	CurrentRevision string `json:"currentRevision,omitempty"`
 
 	// conditions represent the current state of the SandboxSet resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
@@ -96,6 +157,8 @@ type SandboxSetStatus struct {
 // +kubebuilder:resource:path=sandboxsets,shortName={sbs},singular=sandboxset
 // +kubebuilder:storageversion
 // +kubebuilder:printcolumn:name="Replicas",type="integer",JSONPath=".status.replicas"
+// +kubebuilder:printcolumn:name="Updated",type="integer",JSONPath=".status.updatedReplicas"
+// +kubebuilder:printcolumn:name="Expected",type="integer",JSONPath=".status.expectedUpdatedReplicas"
 // +kubebuilder:printcolumn:name="Available",type="integer",JSONPath=".status.availableReplicas"
 // +kubebuilder:printcolumn:name="UpdateRevision",type="string",JSONPath=".status.updateRevision"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"

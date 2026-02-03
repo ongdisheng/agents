@@ -12,9 +12,11 @@ import (
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/integer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
@@ -214,4 +216,36 @@ func DecodeBase64Proto[T proto.Message](raw string, into T) error {
 		return err
 	}
 	return proto.Unmarshal(decoded, into)
+}
+
+// CalculatePartitionReplicas calculates the absolute partition value for rolling updates.
+// Shared by both update execution and status calculation to avoid duplication.
+func CalculatePartitionReplicas(partition *intstr.IntOrString, replicas int32) (int, error) {
+	if partition == nil {
+		return 0, nil
+	}
+
+	replicasInt := int(replicas)
+	if replicasInt < 1 {
+		replicasInt = 1
+	}
+
+	// roundUp=true ensures at least 1 old sandbox is reserved if partition > "0%" and replicas > 0
+	pValue, err := intstr.GetScaledValueFromIntOrPercent(
+		partition,
+		replicasInt,
+		true,
+	)
+	if err != nil {
+		return pValue, err
+	}
+
+	// If partition < "100%" and replicas > 1, ensure at least 1 sandbox is upgraded
+	if replicasInt > 1 && pValue == replicasInt &&
+		partition.Type == intstr.String && partition.StrVal != "100%" {
+		pValue = replicasInt - 1
+	}
+
+	pValue = integer.IntMax(integer.IntMin(pValue, replicasInt), 0)
+	return pValue, nil
 }
