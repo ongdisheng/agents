@@ -189,7 +189,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 
 		// Calculate and update rolling update status
-		updateStatus(newStatus, allSandboxes, sbs, currentRevision, updateRevision)
+		updateStatus(newStatus, allSandboxes, sbs, updateRevision)
 	}
 
 	// Step 2: delete dead sandboxes

@@ -241,7 +241,7 @@ func updateStatus(
 	newStatus *agentsv1alpha1.SandboxSetStatus,
 	sandboxes []*agentsv1alpha1.Sandbox,
 	sbs *agentsv1alpha1.SandboxSet,
-	currentRevision, updateRevision string,
+	updateRevision string,
 ) {
 	// Count UpdatedReplicas
 	var updatedCount int32
@@ -260,8 +260,9 @@ func updateStatus(
 	}
 	newStatus.ExpectedUpdatedReplicas = sbs.Spec.Replicas - int32(partition)
 
-	// Update CurrentRevision when rolling update completes
-	if currentRevision != updateRevision && updatedCount == newStatus.ExpectedUpdatedReplicas {
+	// Update CurrentRevision when ALL sandboxes have updateRevision
+	// This indicates the rolling update has fully completed, not just reached partition target
+	if updatedCount == newStatus.Replicas && newStatus.Replicas == sbs.Spec.Replicas {
 		newStatus.CurrentRevision = updateRevision
 	}
 }
