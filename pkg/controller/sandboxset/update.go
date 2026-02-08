@@ -13,9 +13,14 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-type updateDiffs struct {
-	updateNum            int
-	updateMaxUnavailable int
+type expectationDiffs struct {
+	// Scale-related fields
+	scaleUpNum   int // Number of sandboxes to scale up including surge
+	scaleDownNum int // Number of sandboxes to scale down when surge drops
+
+	// Update-related fields
+	updateNum            int // Number of sandboxes to update
+	updateMaxUnavailable int // Max unavailable during update
 }
 
 func intAbs(x int) int {
@@ -23,6 +28,10 @@ func intAbs(x int) int {
 		return -x
 	}
 	return x
+}
+
+func isOppositeSigns(a, b int) bool {
+	return (a > 0 && b < 0) || (a < 0 && b > 0)
 }
 
 func isSandboxAvailable(sbx *agentsv1alpha1.Sandbox) bool {
@@ -33,12 +42,12 @@ func isSandboxAvailable(sbx *agentsv1alpha1.Sandbox) bool {
 	return state == agentsv1alpha1.SandboxStateAvailable
 }
 
-func calculateDiffsWithExpectation(
+func calculateExpectationDiffs(
 	sbs *agentsv1alpha1.SandboxSet,
 	sandboxes []*agentsv1alpha1.Sandbox,
 	currentRevision string,
 	updateRevision string,
-) updateDiffs {
+) expectationDiffs {
 	replicas := int(sbs.Spec.Replicas)
 	var partition, maxSurge, maxUnavailable int
 
@@ -90,7 +99,32 @@ func calculateDiffsWithExpectation(
 		updateNewDiff = integer.IntMin(updateNewDiff, 0)
 	}
 
-	// Choose smaller absolute value
+	// Calculate surge when maxSurge is enabled and we have opposite signs
+	var useSurge int
+	if maxSurge > 0 && isOppositeSigns(updateOldDiff, updateNewDiff) {
+		// Take the smaller absolute value
+		useSurge = integer.IntMin(intAbs(updateOldDiff), intAbs(updateNewDiff))
+		// Cap at maxSurge
+		useSurge = integer.IntMin(useSurge, maxSurge)
+	}
+
+	// Calculate expected counts with surge
+	expectedTotalCount := replicas + useSurge
+	currentTotalCount := len(sandboxes)
+
+	// Calculate scaleUpNum
+	var scaleUpNum int
+	if num := expectedTotalCount - currentTotalCount; num > 0 {
+		scaleUpNum = num
+	}
+
+	// Calculate scaleDownNum
+	var scaleDownNum int
+	if num := currentTotalCount - expectedTotalCount; num > 0 {
+		scaleDownNum = num
+	}
+
+	// Choose smaller absolute value for updateNum
 	var updateNum int
 	if intAbs(updateOldDiff) <= intAbs(updateNewDiff) {
 		updateNum = updateOldDiff
@@ -100,7 +134,9 @@ func calculateDiffsWithExpectation(
 
 	updateMaxUnavailable := maxUnavailable + len(sandboxes) - replicas
 
-	return updateDiffs{
+	return expectationDiffs{
+		scaleUpNum:           scaleUpNum,
+		scaleDownNum:         scaleDownNum,
 		updateNum:            updateNum,
 		updateMaxUnavailable: updateMaxUnavailable,
 	}
@@ -122,7 +158,7 @@ func (r *Reconciler) updateSandboxes(
 	}
 
 	// Calculate diffs
-	diffRes := calculateDiffsWithExpectation(sbs, sandboxes, currentRevision, updateRevision)
+	diffRes := calculateExpectationDiffs(sbs, sandboxes, currentRevision, updateRevision)
 	if diffRes.updateNum == 0 {
 		return nil
 	}
